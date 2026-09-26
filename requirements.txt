@@ -1,0 +1,61 @@
+# WakeWatch -- runtime dependencies.
+#
+# Deliberately expressed as ranges, not exact pins. This same file has to
+# resolve on a Windows/Python 3.14 dev box and on a Linux/Python 3.11 hosted
+# builder; hard pins to the versions that happened to resolve locally fail on
+# the other. Exact local versions are recorded in docs/VERSIONS.txt.
+#
+# The CPU wheel index keeps torch to ~200 MB instead of pulling ~2.5 GB of CUDA
+# libraries that a free CPU host cannot use anyway. Remove this line if you are
+# deploying to a GPU box.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# --- models ---------------------------------------------------------------
+torch>=2.2,<3
+segmentation-models-pytorch>=0.3.3    # supplies the mit_b2 SegFormer encoder
+timm>=0.9                             # pulled in by smp for the encoder zoo
+
+# Pinned exactly: the AIS scaler was pickled under scikit-learn 1.6.1, and an
+# exact match removes the InconsistentVersionWarning rather than suppressing it.
+scikit-learn==1.6.1
+joblib>=1.3
+
+# --- data / imaging -------------------------------------------------------
+numpy>=1.26,<3
+pandas>=2.0
+opencv-python-headless>=4.8           # headless: no GUI libs needed on a server
+pillow>=10.0
+
+# --- console --------------------------------------------------------------
+streamlit>=1.40
+altair>=5.0
+
+# Satellite basemaps (Esri World Imagery, no API key). Needs network at view
+# time; set WAKEWATCH_OFFLINE_MAPS=1 to fall back to a plain dark canvas.
+folium>=0.17
+streamlit-folium>=0.20
+
+# Lets the app pull weights from a Hugging Face repo when they are not in the
+# checkout -- required on hosts that do not resolve Git LFS pointers, such as
+# Streamlit Community Cloud. See wakewatch/weights.py.
+huggingface-hub>=0.24
+
+# --- inference API ----------------------------------------------------------
+# api/main.py and run.py --api/--both import these directly; without them the
+# API half of the launcher fails at import time even though the console runs
+# fine on its own.
+fastapi>=0.110
+uvicorn>=0.30
+
+# --- New Investigation (GeoTIFF metadata) ------------------------------------
+# Optional in the sense that the app degrades gracefully without it (falls
+# back to asking the user for any metadata it can't read), but needed for
+# real georeferencing/CRS/acquisition-time extraction from a Sentinel-1
+# GeoTIFF product rather than manual entry. See wakewatch/investigation.py.
+rasterio>=1.3
+
+# --- Investigation report export (PDF) ---------------------------------------
+# Pure-Python, no external binary dependency (no wkhtmltopdf/Chromium needed) --
+# safest choice for a redistributable feature. See wakewatch/report_export.py.
+reportlab>=4.0
+

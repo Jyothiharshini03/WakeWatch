@@ -1,0 +1,489 @@
+"""
+Core pipeline tests.
+
+These assert the properties that make the system trustworthy: that the weights
+match the architectures we declare, that the scaler is actually applied, that
+the detector separates the behaviour it claims to separate, and that the guard
+rails (AOI bounds, drift caveat) genuinely fire.
+"""
+from __future__ import annotations
+
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+warnings.filterwarnings("ignore")
+
+from wakewatch import fusion  # noqa: E402
+from wakewatch.config import (AE_THRESHOLD, FEATURE_ORDER, LAT_MIN, LON_MIN,  # noqa: E402
+                              SAR_INPUT_SIZE, SEQ_LEN)
+from wakewatch.inference import ais as ais_mod  # noqa: E402
+from wakewatch.inference import sar as sar_mod  # noqa: E402
+from wakewatch.inference import trajectory as traj_mod  # noqa: E402
+from wakewatch.registry import get_registry  # noqa: E402
+from wakewatch.scenario.real_ais import WAKASHIO_MMSI, build_scenario  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def scenario():
+    return build_scenario()
+
+
+@pytest.fixture(scope="module")
+def scored(scenario):
+    model, scaler = get_registry()["ais_anomaly"].get()
+    return ais_mod.score_frame(model, scaler, scenario["ais"])
+
+
+# --------------------------------------------------------------------------
+# Weights match declared architectures
+# --------------------------------------------------------------------------
+def test_all_three_models_load_strict():
+    """A silent architecture drift must be a load error, not a wrong answer."""
+    reg = get_registry()
+    reg.warmup()
+    for key in ("sar", "trajectory", "ais_anomaly"):
+        assert reg[key].is_loaded
+        assert reg[key].error is None
+
+
+def test_sar_emits_five_classes():
+    model = get_registry()["sar"].get()
+    rng = np.random.default_rng(0)
+    img = (rng.random((320, 480, 3)) * 255).astype(np.uint8)
+    result = sar_mod.segment(model, img)
+
+    # The network emits 512x512; the result is resampled back to the source.
+    assert result.mask_native.shape == (SAR_INPUT_SIZE, SAR_INPUT_SIZE)
+    assert result.mask.shape == (320, 480)
+    assert result.source_size == (480, 320)
+    assert result.mask.min() >= 0 and result.mask.max() <= 4
+    assert sum(result.class_pixels.values()) == 320 * 480
+
+
+def test_area_is_measured_at_source_resolution():
+    """
+    Guards a silent 3x error. The model always emits 512x512, but a Sentinel-1
+    frame is 1250x650 -- so one raw output pixel spans 24.4 m x 12.7 m, not the
+    10 m the area formula assumes. Measuring before resampling understates
+    ground area by the scene's aspect ratio.
+    """
+    model = get_registry()["sar"].get()
+    rng = np.random.default_rng(1)
+    img = (rng.random((650, 1250, 3)) * 255).astype(np.uint8)
+    result = sar_mod.segment(model, img, pixel_resolution_m=10.0)
+
+    scene_km2 = (1250 * 10 / 1000) * (650 * 10 / 1000)          # 81.25 km2
+    measured = sum(
+        sar_mod.estimate_area_km2(result.mask, c, 10.0) for c in range(5)
+    )
+    assert measured == pytest.approx(scene_km2, rel=1e-6)
+
+    # The same count taken on the raw 512x512 grid would be ~3.1x too small.
+    naive = sum(
+        sar_mod.estimate_area_km2(result.mask_native, c, 10.0) for c in range(5)
+    )
+    assert naive == pytest.approx(scene_km2 / 3.1, rel=0.02)
+
+
+def test_mask_upsampling_invents_no_classes():
+    """INTER_NEAREST only -- interpolation would create fractional class ids."""
+    mask = np.array([[0, 1], [3, 4]], dtype=np.uint8)
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    out = sar_mod.overlay_on_image(img, mask, alpha=1.0)
+    colors = {tuple(c) for c in out.reshape(-1, 3)}
+    allowed = {(0, 0, 0)} | {tuple(sar_mod.CLASS_COLORS_RGB[c]) for c in (1, 3, 4)}
+    assert colors <= allowed
+
+
+# --------------------------------------------------------------------------
+# The scaler is mandatory, not decorative
+# --------------------------------------------------------------------------
+def test_unscaled_input_gives_a_different_answer():
+    """
+    Guards the single most damaging silent bug available here: forgetting the
+    scaler. The model was trained on standardised features and returns
+    confident nonsense on raw ones.
+    """
+    model, scaler = get_registry()["ais_anomaly"].get()
+    row = {"speed": 11.2, "course": 225.0, "rot": 0.0, "msg_type": 1, "status": 0,
+           "accuracy": 1, "course_diff": 0.4, "rot_diff": 0.0, "speed_diff": 0.1,
+           "lat_diff": -0.0008, "long_diff": -0.0011}
+
+    scaled = ais_mod.score_row(model, scaler, row).score
+
+    import torch
+    raw = np.array([[row[f] for f in FEATURE_ORDER]], dtype=np.float64)
+    with torch.no_grad():
+        recon = model(torch.tensor(raw, dtype=torch.float32)).numpy()
+    unscaled = float(np.mean((raw - recon) ** 2))
+
+    assert scaled < AE_THRESHOLD, "normal transit should not flag"
+    assert unscaled > scaled * 100, "skipping the scaler must be obviously wrong"
+
+
+# --------------------------------------------------------------------------
+# The detector separates what it claims to separate
+# --------------------------------------------------------------------------
+def test_grounding_flags_and_normal_transit_does_not(scored):
+    """The casualty must flag heavily; real innocent traffic must not."""
+    wakashio = scored[scored["mmsi"] == WAKASHIO_MMSI]
+    assert wakashio["is_anomaly"].mean() > 0.30
+    assert wakashio["anomaly_score"].max() > 10 * AE_THRESHOLD
+
+    for mmsi, track in scored[scored["mmsi"] != WAKASHIO_MMSI].groupby("mmsi"):
+        assert track["is_anomaly"].mean() < 0.05, f"{mmsi} is innocent traffic"
+
+
+def test_detector_fires_as_the_vessel_loses_way(scored):
+    """
+    The whole value proposition: the strike itself is flagged, not just the
+    hours of sitting on the reef afterwards.
+    """
+    wakashio = scored[scored["mmsi"] == WAKASHIO_MMSI].sort_values("timestamp")
+    approach = wakashio[wakashio["phase"] == "final approach"]
+    assert approach["is_anomaly"].any(), "no flag before the vessel came to rest"
+    first = approach[approach["is_anomaly"]].iloc[0]
+    assert first["speed"] < 5.0, "the flag should coincide with the deceleration"
+
+
+def test_aground_status_is_really_in_the_feed(scenario):
+    """Status 6 is broadcast by the ship, not asserted by us."""
+    ais = scenario["ais"]
+    wakashio = ais[ais["mmsi"] == WAKASHIO_MMSI]
+    assert (wakashio["status"] == 6).any() or (wakashio["phase"] == "aground").any()
+
+
+# --------------------------------------------------------------------------
+# Trajectory guard rails
+# --------------------------------------------------------------------------
+def test_prediction_matches_published_accuracy(scenario):
+    """
+    On real, unseen tracks the model must hit its published error envelope.
+    This is the strongest validation available: genuine AIS the model never
+    trained on, scored against the accuracy its authors claimed.
+    """
+    model = get_registry()["trajectory"].get()
+    ais = scenario["ais"]
+    checked = 0
+    for mmsi, group in ais.groupby("mmsi"):
+        track = group.sort_values("timestamp").reset_index(drop=True)
+        trace = traj_mod.rolling_predictions(model, track)
+        if len(trace) < 30:
+            continue
+        checked += 1
+        median = float(trace["deviation_km"].median())
+        assert median < 0.37, (f"{track['vessel_name'].iloc[0]}: median deviation "
+                               f"{median:.3f} km exceeds the published mean error")
+    assert checked >= 4, "expected several vessels with usable track length"
+
+
+def test_out_of_aoi_history_is_refused():
+    """Silently predicting outside the AOI would be the worst possible failure."""
+    model = get_registry()["trajectory"].get()
+    history = pd.DataFrame({
+        "latitude": [19.0] * SEQ_LEN,          # Arabian Sea, far outside Mauritius
+        "longitude": [70.0] * SEQ_LEN,
+        "speed": [11.0] * SEQ_LEN,
+        "course": [225.0] * SEQ_LEN,
+        "rot": [0.0] * SEQ_LEN,
+    })
+    assert not traj_mod.assess_inputs(history).usable
+    with pytest.raises(ValueError, match="outside the Mauritius AOI"):
+        traj_mod.predict_next_position(model, history, strict=True)
+
+
+def test_wrong_sequence_length_is_refused():
+    history = pd.DataFrame({
+        "latitude": [LAT_MIN + 0.1] * 5, "longitude": [LON_MIN + 0.1] * 5,
+        "speed": [11.0] * 5, "course": [225.0] * 5, "rot": [0.0] * 5,
+    })
+    assessment = traj_mod.assess_inputs(history)
+    assert not assessment.usable
+    assert "exactly 8" in " ".join(assessment.blockers)
+
+
+# --------------------------------------------------------------------------
+# Attribution
+# --------------------------------------------------------------------------
+def test_attribution_names_the_casualty_and_clears_everyone_else(scenario, scored):
+    """
+    The casualty must come top, and every other real vessel in the window --
+    all of them innocent -- must be cleared rather than merely ranked lower.
+    """
+    lat, lon = scenario["spill_position"]
+    results = fusion.attribute(scored, lat, lon, observed_at=scenario["grounding_utc"])
+
+    assert results[0].mmsi == WAKASHIO_MMSI
+    assert results[0].confidence_band == "primary suspect"
+    assert results[0].min_distance_km < 0.5
+
+    for other in results[1:]:
+        assert other.confidence_band == "cleared by proximity", (
+            f"{other.vessel_name} should be cleared, got {other.confidence_band}")
+        assert other.max_anomaly_score == 0.0, (
+            f"{other.vessel_name} was nowhere near the slick")
+
+    assert results[0].total_score > 4 * results[1].total_score
+
+
+def test_attribution_margin_is_decisive(scenario, scored):
+    lat, lon = scenario["spill_position"]
+    results = fusion.attribute(scored, lat, lon, observed_at=scenario["grounding_utc"])
+    assert fusion.summarise(results)["margin"] > 0.2
+
+
+def test_drift_caveat_is_always_present():
+    assert "hindcast" in fusion.drift_caveat().lower()
+    assert "uncertain" in fusion.drift_caveat().lower()
+    # Explicit non-hindcast path still carries a clear caveat too.
+    assert "observed" in fusion.drift_caveat(hindcasted=False).lower()
+
+
+def test_distant_spill_clears_everyone(scored):
+    """A slick 200 km away must not be pinned on anybody."""
+    results = fusion.attribute(scored, -20.30, 55.50,
+                               radius_km=15.0, window_hours=6.0)
+    assert all(r.total_score < 0.2 for r in results)
+    assert "no vessel" in fusion.summarise(results)["verdict"].lower()
+
+
+# --------------------------------------------------------------------------
+# Real AIS integrity
+# --------------------------------------------------------------------------
+def test_every_timestamp_parses():
+    """
+    About 4% of rows carry fractional seconds. A single inferred format drops
+    them silently, which would quietly delete parts of the track.
+    """
+    from wakewatch.scenario.real_ais import load_raw
+    assert load_raw()["timestamp"].notna().all()
+
+
+def test_rot_sentinel_is_neutralised(scenario):
+    """-128 means 'not available', not a hard port swing."""
+    assert (scenario["ais"]["rot"] == -128).sum() == 0
+
+
+def test_grounding_is_detected_from_the_data(scenario):
+    """
+    Position and time are derived from the feed, not hardcoded, and must land
+    on the documented casualty: Pointe d'Esny at 19:25 local (15:25 UTC).
+    """
+    event = scenario["event"]
+    assert event is not None
+    lat, lon = event.position
+    assert traj_mod.haversine_km(lat, lon, -20.4442, 57.7433) < 0.5
+    assert event.utc.strftime("%Y-%m-%d") == "2020-07-25"
+    assert 15 <= event.utc.hour <= 16
+    assert event.gap_seconds < 300, "loss of way should be abrupt"
+
+
+def test_wakashio_never_moves_again(scenario):
+    """Six days aground: no ping after the strike shows meaningful way."""
+    ais = scenario["ais"]
+    after = ais[(ais["mmsi"] == WAKASHIO_MMSI) & (ais["phase"] == "aground")]
+    assert len(after) > 50
+    assert after["speed"].max() < 1.5
+
+
+def test_scenario_is_deterministic():
+    a = build_scenario()["ais"]
+    b = build_scenario()["ais"]
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_every_vessel_stays_inside_the_aoi(scenario):
+    for row in scenario["ais"].itertuples():
+        assert traj_mod.in_aoi(row.latitude, row.longitude), f"{row.vessel_name} left the AOI"
+
+
+# --------------------------------------------------------------------------
+# Curated SAR scene library
+# --------------------------------------------------------------------------
+def test_scene_library_loads():
+    from wakewatch.scenario import sar_scenes
+    scenes = sar_scenes.load_scenes()
+    assert len(scenes) == 5
+    for s in scenes:
+        assert s.image_path.exists(), f"{s.key}: source scene missing"
+        assert s.mask_path.exists(), f"{s.key}: precomputed mask missing"
+
+
+def test_precomputed_masks_match_live_inference():
+    """
+    The stored masks must be what the shipped checkpoint actually produces.
+    If someone swaps the weights without re-running build_sar_scenes.py, the
+    library silently starts lying -- this catches that.
+    """
+    from wakewatch.inference import sar as sar_mod
+    from wakewatch.scenario import sar_scenes
+
+    model = get_registry()["sar"].get()
+    for scene in sar_scenes.load_scenes():
+        live = sar_mod.segment(model, scene.load_image()).mask
+        stored = scene.load_mask()
+        assert stored.shape == live.shape, f"{scene.key}: shape drift"
+        agreement = float((stored == live).mean())
+        assert agreement > 0.99, f"{scene.key}: stored mask differs from live ({agreement:.3f})"
+
+
+def test_scene_masks_are_coherent_not_noise():
+    """
+    The old checkpoint emitted salt-and-pepper noise. A real segmentation has
+    large contiguous regions, so horizontal class changes stay rare.
+    """
+    from wakewatch.scenario import sar_scenes
+    for scene in sar_scenes.load_scenes():
+        m = scene.load_mask()
+        churn = float((m[:, 1:] != m[:, :-1]).mean())
+        assert churn < 0.08, f"{scene.key}: mask looks like noise (churn {churn:.3f})"
+
+
+def test_library_separates_oil_from_lookalike():
+    """The library must contain both a real spill and a convincing non-spill."""
+    from wakewatch.scenario import sar_scenes
+    scenes = {s.key: s for s in sar_scenes.load_scenes()}
+
+    assert scenes["wakashio_reef"].oil_detected
+    assert scenes["wakashio_reef"].oil_area_km2 > 1.0
+
+    lookalike = scenes["very_maria_pass"]
+    assert lookalike.oil_area_km2 < 0.05
+    assert lookalike.lookalike_area_km2 > 1.0
+
+    assert scenes["palona_pass"].oil_area_km2 == 0.0
+
+
+def test_every_scene_names_a_vessel_from_the_real_feed(scenario):
+    """Scene vessels must exist in the AIS feed, not be invented for the demo."""
+    from wakewatch.scenario import sar_scenes
+    known = set(scenario["ais"]["mmsi"].unique())
+    scenes = sar_scenes.load_scenes()
+    assert len(scenes) == 5
+    for sc in scenes:
+        assert sc.mmsi in known, f"{sc.key} names MMSI {sc.mmsi}, absent from the feed"
+        assert sar_scenes.by_mmsi(sc.mmsi).key == sc.key
+    assert sar_scenes.by_mmsi(WAKASHIO_MMSI).key == "wakashio_reef"
+
+
+def test_only_the_casualty_scene_carries_a_major_slick(scored):
+    """
+    Naming innocent vessels is fine; implying they spilled is not.
+
+    The bar is relative, not a magic number: no innocent vessel's scene may
+    approach the casualty's, and any vessel whose scene does show oil must
+    still read clean on its own AIS so the console clears it.
+    """
+    from wakewatch.scenario import sar_scenes
+    scenes = {sc.mmsi: sc for sc in sar_scenes.load_scenes()}
+    casualty = scenes[WAKASHIO_MMSI]
+    assert casualty.oil_area_km2 > 1.0
+
+    for mmsi, sc in scenes.items():
+        if mmsi == WAKASHIO_MMSI:
+            continue
+        assert sc.oil_area_km2 < casualty.oil_area_km2 / 3, (
+            f"{sc.vessel} carries {sc.oil_area_km2:.2f} km2 against the casualty's "
+            f"{casualty.oil_area_km2:.2f} -- too close to read as innocent")
+        track = scored[scored["mmsi"] == mmsi]
+        assert track["is_anomaly"].mean() < 0.05, f"{sc.vessel} should read as clean"
+
+
+def test_sar_checkpoint_is_trained():
+    """
+    The first checkpoint shipped with an untrained decoder and emitted noise.
+    BatchNorm running statistics are the tell: never updated means never
+    trained through.
+    """
+    import torch
+    from wakewatch.config import SAR_WEIGHTS
+    sd = torch.load(SAR_WEIGHTS, map_location="cpu")
+    tracked = {int(v) for k, v in sd.items() if k.endswith("num_batches_tracked")}
+    assert tracked and max(tracked) > 0, "SAR decoder BatchNorm was never trained"
+
+
+def test_no_invented_vessels_remain(scenario):
+    """
+    An earlier build carried six fabricated vessels. Their names and MMSIs must
+    not survive anywhere a user can see them -- including colour lookup tables,
+    which is where the last one hid.
+    """
+    import re
+    from pathlib import Path
+
+    from ui import theme
+
+    banned_names = ["SEA HARVESTER", "BLUE BAY TRADER", "BULK PIONEER",
+                    "CAP FLORES", "KAVERI PRIDE"]
+    banned_mmsis = {371284000, 645079210, 352001899, 563114900, 256891004, 419002731}
+
+    real = set(scenario["ais"]["mmsi"].unique())
+    assert set(theme.VESSEL_COLORS) <= real, "colour map references unknown MMSIs"
+    assert not (set(theme.VESSEL_COLORS) & banned_mmsis)
+
+    root = Path(__file__).resolve().parent.parent
+    for path in list((root / "wakewatch").rglob("*.py")) + list((root / "ui").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for name in banned_names:
+            assert name not in text, f"{path.name} still references {name}"
+
+
+def test_coverage_gaps_are_flagged_not_counted(scenario):
+    """
+    Satellite AIS drops out routinely. The model predicts *the next ping*, so a
+    ping arriving 26 minutes late makes a perfectly ordinary transit look like a
+    9 km blunder. Those windows must be marked, and excluded from accuracy.
+    """
+    model = get_registry()["trajectory"].get()
+    ais = scenario["ais"]
+    track = ais[ais["mmsi"] == WAKASHIO_MMSI].sort_values("timestamp").reset_index(drop=True)
+
+    trace = traj_mod.rolling_predictions(model, track)
+    assert "coverage_gap" in trace.columns
+    assert trace["coverage_gap"].any(), "this feed definitely contains dropouts"
+
+    clean = traj_mod.clean_trace(trace)
+    assert len(clean) < len(trace)
+    assert clean["deviation_km"].max() < trace["deviation_km"].max()
+
+    # Every flagged window must genuinely have a late truth ping.
+    flagged = trace[trace["coverage_gap"]]
+    assert (flagged["gap_s"] > flagged["cadence_s"]).all()
+
+
+def test_route_deviation_opens_on_the_approach():
+    """
+    The page must open on the run-in to the grounding, not on eight identical
+    zero-knot pings from the middle of the wreck, where a next-position
+    prediction carries no information.
+    """
+    from ui.views.trajectory_view import _default_window
+
+    model = get_registry()["trajectory"].get()
+    scored = engine_scored()
+    track = scored[scored["mmsi"] == WAKASHIO_MMSI].sort_values(
+        "timestamp").reset_index(drop=True)
+    trace = traj_mod.rolling_predictions(model, track)
+
+    start = _default_window(track, trace, max(0, len(track) - SEQ_LEN - 1))
+    window = track.iloc[start:start + SEQ_LEN]
+
+    assert window["speed"].iloc[0] > 5.0, "window should open with the vessel under way"
+    assert window["speed"].iloc[-1] < 5.0, "window should end on the deceleration"
+    assert traj_mod.assess_inputs(window).confidence == "nominal"
+
+
+def engine_scored():
+    """Score the scenario the way the console does."""
+    from wakewatch.inference import ais as _ais
+    model, scaler = get_registry()["ais_anomaly"].get()
+    return _ais.score_frame(model, scaler, build_scenario()["ais"])
